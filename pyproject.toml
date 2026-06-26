@@ -13,3 +13,8 @@ dependencies = [
     "seleniumbase>=4.49.14",
     "setuptools>=82.0.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]
