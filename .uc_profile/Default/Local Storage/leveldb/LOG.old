@@ -1,5 +1,0 @@
-2026/06/26-14:20:46.815 b4c3b Reusing MANIFEST /home/sysadmin/Grocery/.uc_profile/Default/Local Storage/leveldb/MANIFEST-000001
-2026/06/26-14:20:46.820 b4c3b Recovering log #3
-2026/06/26-14:20:46.821 b4c3b Level-0 table #3: started
-2026/06/26-14:20:46.828 b4c3b Level-0 table #3: 125816 bytes OK
-2026/06/26-14:20:46.834 b4c3b Delete type=0 #3
