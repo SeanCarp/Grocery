@@ -3,9 +3,26 @@ import random, time
 from enum import Enum
 from dataclasses import dataclass
 from collections.abc import Sequence
+from pathlib import Path
+from urllib.parse import quote
 
 # Optional Frameworks: Seleniumbase, Pydoll
-from seleniumbase import sb_cdp, SB
+from seleniumbase import sb_cdp
+
+# Dedicated profile (never your personal Chrome one): it keeps the DataDome cookie between runs.
+PROFILE_DIR = Path(__file__).resolve().with_name(".chrome-profile")
+
+# DataDome draws its page in an iframe: t=bv is a hard block, t=fe is the slider CAPTCHA.
+DATADOME_CHALLENGE = """(() => {
+  const frame = document.querySelector('iframe[src*="captcha-delivery.com"]');
+  return frame ? new URL(frame.src).searchParams.get('t') || 'unknown' : null;
+})()"""
+RESULT_TILE = "li.product-grid-cell"
+TILE_COUNT = f"document.querySelectorAll('{RESULT_TILE}').length"
+SHOW_MORE = "#show-more-button"
+
+class AccessBlocked(RuntimeError):
+    """The store's bot protection refused this browser."""
 
 class CollectionType(Enum):
     SCRAPE = "scrape"
@@ -15,6 +32,7 @@ class CollectionType(Enum):
 class GroceryStore:
     endpoint: str
     method: CollectionType
+    search_path: str | None = None  # "{}" is replaced by the URL-quoted search term
 
 class StoreDefinition(str, Enum):
     FOODLION = "Food Lion"
@@ -27,10 +45,12 @@ class StoreDefinition(str, Enum):
 
 GroceryStores = {
     StoreDefinition.FOODLION: GroceryStore(
-        "https://foodlion.com", CollectionType.SCRAPE
+        "https://foodlion.com", CollectionType.SCRAPE,
+        "/product-search/{}?searchRef=&semanticSearch=false"
     ),
     StoreDefinition.GIANT: GroceryStore(
-        "https://giantfood.com", CollectionType.SCRAPE
+        "https://giantfood.com", CollectionType.SCRAPE,
+        "/product-search/{}?searchRef=&semanticSearch=false"
     ),
     StoreDefinition.SAMSCLUB: GroceryStore(
         "https://www.samsclub.com", CollectionType.SCRAPE
@@ -72,98 +92,60 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.set_defaults(browser_mode="auto")
     return parser.parse_args(argv)
 
-def search_with_browser(store: GroceryStore, search_term: str, headless: bool):
-    # TODO: Is this better or worse to add these flags
-    # options.add_argument("--disable-blink-features=AutomationControlled")
-    # options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    # TODO: Can you do this using `with`
+def wait_for_access(sb, headless: bool) -> None:
+    """Return once no DataDome challenge is showing; raise if it cannot be passed."""
+    deadline = time.monotonic() + 120
+    prompted = False
+    while challenge := sb.evaluate(DATADOME_CHALLENGE):
+        if challenge == "bv":
+            raise AccessBlocked(
+                "DataDome blocked this browser/IP ('Access is temporarily restricted'). "
+                "Retrying right away will not help; wait a few hours or change networks."
+            )
+        if headless:
+            raise AccessBlocked("DataDome wants a CAPTCHA. Rerun with --headed and complete it once.")
+        if time.monotonic() > deadline:
+            raise AccessBlocked("DataDome CAPTCHA was not completed within 120 seconds.")
+        if not prompted:
+            print("DataDome CAPTCHA: complete the slider in the browser window (remembered by the profile).")
+            prompted = True
+        sb.sleep(1)
 
-    # sb = sb_cdp.Chrome(headless=headless)
-    # sb.goto(store.endpoint)
-    # sb.sleep(random.uniform(2.0, 3.0))
+def search_with_browser(store: GroceryStore, search_term: str, headless: bool) -> str:
+    """Load every search result (Show More until it disappears) and return the page HTML."""
+    if store.search_path is None:
+        raise NotImplementedError(f"No search URL for {store.endpoint} yet.")
+    search_url = store.endpoint + store.search_path.format(quote(search_term, safe=""))
 
-    # print("Solving the CAPTCHA")
-    # sb.solve_captcha()
+    # headed=True keeps SeleniumBase off Xvfb on Linux. No agent/locale options:
+    # SeleniumBase applies them as a CDP user-agent override, which DataDome blocks outright.
+    sb = sb_cdp.Chrome(
+        store.endpoint, headed=not headless, headless=headless, user_data_dir=str(PROFILE_DIR)
+    )
+    try:
+        # A cookieless deep link to search is always blocked; the homepage lets DataDome validate the cookie first.
+        sb.sleep(random.uniform(4.0, 6.0))
+        wait_for_access(sb, headless)
+        sb.open(search_url)
+        sb.sleep(random.uniform(2.0, 3.0))
+        wait_for_access(sb, headless)
+        sb.wait_for_element_visible(RESULT_TILE, timeout=20)
 
-    # print("Clicking the input bar")
-    # sb.click("#typeahead-input") # TODO: Should be parameter
-    # sb.sleep(random.uniform(0.5, 1.0))
+        while sb.is_element_visible(SHOW_MORE):
+            shown = sb.evaluate(TILE_COUNT)
+            sb.click(SHOW_MORE)
+            deadline = time.monotonic() + 20
+            while sb.evaluate(TILE_COUNT) <= shown:
+                wait_for_access(sb, headless)
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Show More stopped loading products after {shown}.")
+                sb.sleep(1)
+            sb.sleep(random.uniform(1.0, 2.5))
 
-    # sb.press_keys("#typeahead-input") # TODO: Should be parameter
-    # sb.sleep(random.uniform(2.0, 3.0))
-
-    BUTTON = "#typeahead-input"
-    with SB(uc=True, test=True, headless=False, user_data_dir="/home/swcar/.config/google-chrome/Default", agent="Chrome") as sb:
-        sb.uc_open_with_reconnect(store.endpoint, reconnect_time=3)
-        for _ in range(3):
-            sb.scroll_down(amount=random.randint(200, 500))
-            sb.sleep(random.uniform(0.5, 1.5))
-
-        for _ in range(3):
-            if "captcha-delivery.com" in sb.get_current_url():
-                try:
-                    sb.solve_captcha(timeout=20)
-                    break
-                except Exception:
-                    print("Challenge appeared - solve manually in the window")
-                    sb.sleep(15)
-
-        clicks = 0
-        while clicks < 50:
-            if "captcha-delivery.com" in sb.get_current_url():
-                try:
-                    sb.solve_captcha(timeout=15)
-                except Exception:
-                    sb.sleep(10)
-                continue
-
-            if sb.is_element_visible(BUTTON):
-                sb.scroll_to_click(BUTTON)
-                clicks += 1
-                sb.sleep(random.uniform(1.5, 4.0))
-            else:
-                try:
-                    sb.wait_for_element_visible(BUTTON, timeout=3)
-                    continue
-                except Exception:
-                    break
-
-        sb.wait_for_element_absent(BUTTON, timeout=5)
-        print(f"Clicked {clicks} time(s).")
-
-    #     sb.press_keys("input#typeahead-input", search_term + "\n")
-    #     sb.sleep(random.uniform(2.0, 3.0))
-    #     n = click_until_gone(driver, Button)
-    # finally:
-    #     driver.quit()
-
-    # quit()
-    # with uc.Chrome(options=options, executable_path="/usr/bin/google-chrome-stable",
-    #                driver_executable_path="/home/swcar/Projects/Grocery/.venv/lib/python3.12/site-packages/seleniumbase/drivers/uc_driver"
-    #         ) as sb:
-
-
-    #     # Scroll all the way down to page and click "Show More", until "Show More" stops showing up
-    #     # Applies: FOOD LION, GIANT FOODS, 
-    #     food_lion_sm_button = "button#show-more-button"
-    #     MAX_CLICKS = 20
-    #     clicks = 0
-    #     while clicks < MAX_CLICKS:
-    #         if sb.is_element_visible(food_lion_sm_button):
-    #             print("Scrolling/Clicking Show More Button")
-    #             sb.scroll_to_click(food_lion_sm_button)
-    #             clicks += 1
-    #             sb.sleep(random.uniform(0.5, 1.5))
-    #         else:
-    #             try:
-    #                 print("Waiting for the button to render (~3secs)")
-    #                 sb.wait_for_element_visible(food_lion_sm_button, timeout=3)
-    #                 continue
-    #             except Exception:
-    #                 break
-        
-        
-
+        print(f"Loaded {sb.evaluate(TILE_COUNT)} products from {search_url}")
+        return sb.get_page_source()
+    finally:
+        sb.quit()
 
 
 def prompt_grocery_store() -> GroceryStore:
@@ -205,8 +187,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         headless = True if args.browser_mode == "headless" else False
         run_search(store, search_term, headless)
     
+    except AccessBlocked as error:
+        print(f"Blocked: {error}")
+        return 1
     except KeyboardInterrupt:
         print("\nSearch canceled.")
+    return 0
         
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
